@@ -1,0 +1,107 @@
+version: "3.8"
+
+services:
+  # ---------- MinIO Object Storage ----------
+  minio:
+    image: minio/minio:latest
+    container_name: datalake_server
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console UI
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password2026
+    volumes:
+      - minio_data:/data
+
+  # MinIO bucket setup
+  minio-setup:
+    image: minio/mc:latest
+    container_name: datalake_minio_setup_server
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5 &&
+      mc alias set local http://minio:9000 admin password2026 &&
+      mc mb -p local/bronze || true &&
+      mc mb -p local/silver || true &&
+      mc mb -p local/gold || true &&
+      mc mb -p local/logs || true &&
+      echo 'Buckets created (or already exist)';"
+
+  # ---------- Hadoop NameNode ----------
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: hdfs_namenode
+    environment:
+      - CLUSTER_NAME=datalake_cluster
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+    ports:
+      - "9870:9870"
+    volumes:
+      - hdfs_namenode:/hadoop/dfs/name
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: hdfs_datanode
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+    depends_on:
+      - namenode
+    ports:
+      - "9864:9864"
+    volumes:
+      - hdfs_datanode:/hadoop/dfs/data
+
+
+  # ---------- Python Pipeline ----------
+  pipeline:
+    build: ./pipeline
+    container_name: datalake_pipeline
+    depends_on:
+      - minio-setup
+      - namenode
+      - datanode
+    volumes:
+      - ./data:/pipeline/data
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: admin
+      MINIO_SECRET_KEY: password2026
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      SPARK_MASTER: local[*]
+      JAVA_HOME: /usr/lib/jvm/java-11-openjdk-amd64
+      LOCAL_DATA_DIR: /pipeline/data
+      OUTPUT_DIR: /pipeline/data/analysis
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for MinIO...';
+      until curl -s http://minio:9000/minio/health/live > /dev/null; do
+          echo 'MinIO not ready, retrying...';
+          sleep 5;
+      done;
+      echo 'MinIO Ready!';
+
+      echo 'Waiting for HDFS...';
+      until curl -s http://namenode:9870 > /dev/null; do
+          echo 'HDFS not ready, retrying...';
+          sleep 5;
+      done;
+      echo 'HDFS Ready!';
+
+        echo 'Waiting for DataNode...';
+        until curl -s http://datanode:9864 > /dev/null; do
+          echo 'DataNode not ready, retrying...';
+          sleep 5;
+        done;
+        echo 'DataNode Ready!';
+
+      python run_pipeline.py
+      "
+
+volumes:
+  minio_data:
+  hdfs_namenode:
+  hdfs_datanode:
