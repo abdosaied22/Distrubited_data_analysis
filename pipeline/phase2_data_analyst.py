@@ -1,94 +1,119 @@
 import os
-import matplotlib
-
-matplotlib.use("Agg")
+from pathlib import Path
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
+# ─── Configuration & Paths ───────────────────────────────────────────────────
+BASE_PATH = "/pipeline/data"
+# Reading the cleaned CSV we just created in Phase 1
+CLEANED_DATA_PATH = f"{BASE_PATH}/cleaned_data/amazon_cleaned.csv"
+OUTPUT_DIR = f"{BASE_PATH}/analysis/figures"
+SUMMARY_FILE = f"{BASE_PATH}/analysis/business_summary.csv"
 
-def get_spark(app_name: str) -> SparkSession:
-    hdfs_uri = os.getenv("CORE_CONF_fs_defaultFS", "hdfs://namenode:9000")
-    yarn_rm = os.getenv("YARN_CONF_yarn_resourcemanager_hostname", "resourcemanager")
-    spark_master = os.getenv("SPARK_MASTER", "yarn")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    spark = (
-        SparkSession.builder.appName(app_name)
-        .master(spark_master)
-        .config("spark.submit.deployMode", "client")
-        .config("spark.hadoop.fs.defaultFS", hdfs_uri)
-        .config("spark.hadoop.yarn.resourcemanager.hostname", yarn_rm)
-        .config(
-            "spark.hadoop.dfs.replication", os.getenv("HDFS_CONF_dfs_replication", "1")
-        )
-        .getOrCreate()
+# ─── Spark Session ────────────────────────────────────────────────────────────
+spark = (
+    SparkSession.builder.appName("Phase2_Amazon_Analyst")
+    .config("spark.hadoop.fs.defaultFS", "hdfs://namenode:9000")
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+
+# ─── 1. Load Data ─────────────────────────────────────────────────────────────
+# We use the local CSV for EDA and visualization
+cleaned_uri = f"file://{Path(CLEANED_DATA_PATH).resolve()}"
+df = spark.read.csv(cleaned_uri, header=True, inferSchema=True)
+print(f"[INFO] Analyzing {df.count()} orders.")
+
+# ─── 2. Key Metrics Summary ───────────────────────────────────────────────────
+summary_stats = df.select(
+    "TotalAmount", "Quantity", "Discount", "ShippingCost"
+).describe()
+summary_stats.toPandas().to_csv(SUMMARY_FILE, index=False)
+
+# ─── 3. Category Performance (EDA) ───────────────────────────────────────────
+category_analysis = (
+    df.groupBy("Category")
+    .agg(
+        F.sum("TotalAmount").alias("Total_Revenue"),
+        F.count("OrderID").alias("Order_Count"),
+        F.avg("TotalAmount").alias("Avg_Order_Value"),
     )
-    return spark
+    .orderBy(F.desc("Total_Revenue"))
+)
+category_analysis.show()
 
+# ─── 4. Monthly Trend Analysis ──────────────────────────────────────────────
+# Creating a monthly trend to see seasonality
+monthly_trend = (
+    df.withColumn("YearMonth", F.date_format("OrderDate", "yyyy-MM"))
+    .groupBy("YearMonth")
+    .agg(F.sum("TotalAmount").alias("Revenue"))
+    .orderBy("YearMonth")
+)
 
-def main() -> None:
-    spark = get_spark("DemandForecasting-Phase2-DataAnalyst")
-    hdfs_uri = os.getenv("CORE_CONF_fs_defaultFS", "hdfs://namenode:9000")
-    cleaned_path = f"{hdfs_uri}/user/data-engineer/demand_forecasting/cleaned_data"
+# Analyze trends and patterns in sales data
+monthly_trend_pdf = monthly_trend.toPandas()
+monthly_trend_pdf["Revenue_Change_Pct"] = (
+    monthly_trend_pdf["Revenue"].pct_change().fillna(0) * 100
+)
+monthly_trend_pdf.to_csv(f"{BASE_PATH}/analysis/monthly_trend.csv", index=False)
 
-    output_dir = os.getenv("OUTPUT_DIR", "/pipeline/data/analysis")
-    os.makedirs(output_dir, exist_ok=True)
+# ─── 5. Visualizations (Pandas/Seaborn) ──────────────────────────────────────
+# Switch to Pandas for Plotting
+pdf = df.toPandas()
+sns.set_theme(style="whitegrid")
 
-    df = spark.read.parquet(cleaned_path)
-    print("Basic describe() stats:")
-    describe_df = df.describe()
-    describe_df.show()
+# Figure 1: Revenue by Category
+plt.figure(figsize=(12, 6))
+cat_pdf = category_analysis.toPandas()
+sns.barplot(data=cat_pdf, x="Total_Revenue", y="Category", palette="viridis")
+plt.title("Total Revenue by Product Category")
+plt.savefig(f"{OUTPUT_DIR}/01_revenue_by_category.png")
+plt.close()
 
-    pd_df = df.toPandas()
-    describe_pd = describe_df.toPandas()
-    describe_pd.to_csv(f"{output_dir}/describe_stats.csv", index=False)
+# Figure 4: Monthly Revenue Trend
+plt.figure(figsize=(12, 6))
+sns.lineplot(data=monthly_trend_pdf, x="YearMonth", y="Revenue", marker="o")
+plt.title("Monthly Revenue Trend")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/04_monthly_revenue_trend.png")
+plt.close()
 
-    daily_sales = pd_df.groupby("order_date")["total_sales"].sum().reset_index()
-    daily_sales = daily_sales.sort_values("order_date")
+# Figure 2: Sales Distribution
+plt.figure(figsize=(10, 6))
+sns.histplot(pdf["TotalAmount"], bins=30, kde=True, color="blue")
+plt.title("Distribution of Order Total Amounts")
+plt.xlabel("Total Amount ($)")
+plt.savefig(f"{OUTPUT_DIR}/02_sales_distribution.png")
+plt.close()
 
-    plt.figure(figsize=(12, 6))
-    sns.lineplot(x="order_date", y="total_sales", data=daily_sales)
-    plt.title("Daily Total Sales Over Time")
-    plt.xlabel("Date")
-    plt.ylabel("Total Sales")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/daily_sales_trend.png")
-    plt.close()
+# Figure 3: Payment Method Preference
+plt.figure(figsize=(8, 8))
+pdf["PaymentMethod"].value_counts().plot.pie(
+    autopct="%1.1f%%", colors=sns.color_palette("pastel")
+)
+plt.title("Payment Method Distribution")
+plt.ylabel("")
+plt.savefig(f"{OUTPUT_DIR}/03_payment_methods.png")
+plt.close()
 
-    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+# ─── 6. Geographic Insights ──────────────────────────────────────────────────
+top_cities = (
+    df.groupBy("City")
+    .agg(F.sum("TotalAmount").alias("City_Revenue"))
+    .orderBy(F.desc("City_Revenue"))
+    .limit(10)
+)
+top_cities.toPandas().to_csv(f"{BASE_PATH}/analysis/top_10_cities.csv", index=False)
 
-    product_sales = (
-        pd_df.groupby("product_id")["total_sales"]
-        .sum()
-        .sort_values(ascending=False)
-        .reset_index()
-    )
-    sns.barplot(x="product_id", y="total_sales", data=product_sales, ax=axes[0])
-    axes[0].set_title("Total Sales by Product")
-    axes[0].set_xlabel("Product ID")
-    axes[0].set_ylabel("Total Sales")
-    axes[0].tick_params(axis="x", rotation=45)
+# ─── Done ─────────────────────────────────────────────────────────────────────
+print(f"✅ EDA Complete. Figures saved in: {OUTPUT_DIR}")
+print(f"✅ Business summary saved in: {SUMMARY_FILE}")
 
-    store_sales = (
-        pd_df.groupby("store_id")["total_sales"]
-        .sum()
-        .sort_values(ascending=False)
-        .reset_index()
-    )
-    sns.barplot(x="store_id", y="total_sales", data=store_sales, ax=axes[1])
-    axes[1].set_title("Total Sales by Store")
-    axes[1].set_xlabel("Store ID")
-    axes[1].set_ylabel("Total Sales")
-    axes[1].tick_params(axis="x", rotation=45)
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/sales_by_product_store.png")
-    plt.close()
-
-    print(f"Saved plots to: {output_dir}")
-    spark.stop()
-
-
-if __name__ == "__main__":
-    main()
+spark.stop()

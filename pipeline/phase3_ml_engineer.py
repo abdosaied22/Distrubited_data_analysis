@@ -1,156 +1,118 @@
 import os
-import json
+import sys
+import joblib
+import pandas as pd
+import numpy as np
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col,
-    dayofmonth,
-    dayofweek,
-    month,
-    year,
-    weekofyear,
-    lag,
-)
-from pyspark.sql.window import Window
-from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.feature import VectorAssembler, StringIndexer, OneHotEncoder
-from pyspark.ml.regression import LinearRegression
+from pyspark.sql import functions as F
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import VectorAssembler, StandardScaler
+from pyspark.ml.regression import LinearRegression, RandomForestRegressor, GBTRegressor
 from pyspark.ml.evaluation import RegressionEvaluator
 
+# ─── Environment Configuration ───────────────────────────────────────────────
+HDFS_URI = os.getenv("CORE_CONF_fs_defaultFS", "hdfs://namenode:9000")
+# Using the same HDFS path as your run_pipeline.py
+INPUT_PATH = f"{HDFS_URI}/user/data-engineer/amazon_project/cleaned_data"
+LOCAL_ANALYSIS_PATH = "/pipeline/data/analysis"
+MODEL_SAVE_BASE = "/pipeline/data/models"
 
-def get_spark(app_name: str) -> SparkSession:
-    hdfs_uri = os.getenv("CORE_CONF_fs_defaultFS", "hdfs://namenode:9000")
-    yarn_rm = os.getenv("YARN_CONF_yarn_resourcemanager_hostname", "resourcemanager")
-    spark_master = os.getenv("SPARK_MASTER", "yarn")
+os.makedirs(LOCAL_ANALYSIS_PATH, exist_ok=True)
+os.makedirs(MODEL_SAVE_BASE, exist_ok=True)
 
-    spark = (
-        SparkSession.builder.appName(app_name)
-        .master(spark_master)
-        .config("spark.submit.deployMode", "client")
-        .config("spark.hadoop.fs.defaultFS", hdfs_uri)
-        .config("spark.hadoop.yarn.resourcemanager.hostname", yarn_rm)
-        .config(
-            "spark.hadoop.dfs.replication", os.getenv("HDFS_CONF_dfs_replication", "1")
-        )
-        .getOrCreate()
-    )
-    return spark
+spark = SparkSession.builder.appName("Phase3_ML_Production").getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
 
+# ─── 1. Load & Prep ──────────────────────────────────────────────────────────
+try:
+    print(f"[INFO] Reading from HDFS: {INPUT_PATH}")
+    df = spark.read.parquet(INPUT_PATH)
+except Exception as e:
+    print(f"CRITICAL ERROR: Path not found in HDFS. Ensure Phase 1 ran correctly: {e}")
+    sys.exit(1)
 
-def main() -> None:
-    spark = get_spark("DemandForecasting-Phase3-MLEngineer")
-    hdfs_uri = os.getenv("CORE_CONF_fs_defaultFS", "hdfs://namenode:9000")
+# Feature Engineering: Adding Month and DayOfWeek
+df_ml = df.withColumn("Month", F.month("OrderDate")) \
+          .withColumn("DayOfWeek", F.dayofweek("OrderDate")) \
+          .fillna(0)
 
-    cleaned_path = f"{hdfs_uri}/user/data-engineer/demand_forecasting/cleaned_data"
-    model_root = f"{hdfs_uri}/user/data-engineer/demand_forecasting/models"
-    featurizer_path = f"{model_root}/featurizer_pipeline_model"
-    lr_model_path = f"{model_root}/linear_regression_model"
+# ─── 2. Setup Evaluation ─────────────────────────────────────────────────────
+# We will track RMSE, MSE, and R2
+evaluator_rmse = RegressionEvaluator(labelCol="TotalAmount", predictionCol="prediction", metricName="rmse")
+evaluator_mse = RegressionEvaluator(labelCol="TotalAmount", predictionCol="prediction", metricName="mse")
+evaluator_r2 = RegressionEvaluator(labelCol="TotalAmount", predictionCol="prediction", metricName="r2")
 
-    local_model_root = os.getenv("ML_LOCAL_MODEL_DIR", "/pipeline/data/ml/models")
-    local_featurizer_path = f"file://{local_model_root}/featurizer_pipeline_model"
-    local_lr_model_path = f"file://{local_model_root}/linear_regression_model"
+FEATURE_COLS = ["Quantity", "Discount", "Tax", "ShippingCost", "Month", "DayOfWeek"]
+assembler = VectorAssembler(inputCols=FEATURE_COLS, outputCol="features")
+scaler = StandardScaler(inputCol="features", outputCol="scaledFeatures")
 
-    output_dir = os.getenv("ML_OUTPUT_DIR", "/pipeline/data/ml")
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(local_model_root, exist_ok=True)
+train_df, test_df = df_ml.randomSplit([0.8, 0.2], seed=42)
+accuracy_metrics = []
 
-    df = spark.read.parquet(cleaned_path)
+# ─── 3. Train & Evaluate Models ──────────────────────────────────────────────
+models = {
+    "Linear_Regression": LinearRegression(featuresCol="scaledFeatures", labelCol="TotalAmount"),
+    "Random_Forest": RandomForestRegressor(featuresCol="scaledFeatures", labelCol="TotalAmount"),
+    "Gradient_Boosting": GBTRegressor(featuresCol="scaledFeatures", labelCol="TotalAmount")
+}
 
-    daily_agg_df = (
-        df.groupBy("order_date", "product_id", "store_id")
-        .agg({"quantity": "sum", "total_sales": "sum"})
-        .withColumnRenamed("sum(quantity)", "daily_quantity")
-        .withColumnRenamed("sum(total_sales)", "daily_total_sales")
-    )
+for name, model_obj in models.items():
+    print(f"[INFO] Training {name}...")
+    pipeline = Pipeline(stages=[assembler, scaler, model_obj])
+    fit_model = pipeline.fit(train_df)
+    
+    # Save Model to local disk (which is your mapped volume)
+    fit_model.write().overwrite().save(f"{MODEL_SAVE_BASE}/{name}")
+    
+    # Predictions & Metrics
+    preds = fit_model.transform(test_df)
+    rmse = evaluator_rmse.evaluate(preds)
+    mse = evaluator_mse.evaluate(preds)
+    r2 = evaluator_r2.evaluate(preds)
+    
+    accuracy_metrics.append({
+        "Model": name,
+        "RMSE": rmse,
+        "MSE": mse,
+        "R2": r2
+    })
 
-    window_spec = Window.partitionBy("product_id", "store_id").orderBy("order_date")
+# ─── 4. ARIMA (Time Series) ──────────────────────────────────────────────────
+print("[INFO] Processing ARIMA...")
+from statsmodels.tsa.arima.model import ARIMA
 
-    daily_agg_df = (
-        daily_agg_df.withColumn("day_of_month", dayofmonth(col("order_date")))
-        .withColumn("day_of_week", dayofweek(col("order_date")))
-        .withColumn("month", month(col("order_date")))
-        .withColumn("year", year(col("order_date")))
-        .withColumn("week_of_year", weekofyear(col("order_date")))
-        .withColumn("lag_1_day_qty", lag(col("daily_quantity"), 1).over(window_spec))
-        .fillna(0, subset=["lag_1_day_qty"])
-    )
+ts_data = df_ml.groupBy("OrderDate").agg(F.sum("TotalAmount").alias("Sales")).toPandas()
+ts_data['OrderDate'] = pd.to_datetime(ts_data['OrderDate'])
+ts_data = ts_data.set_index('OrderDate').sort_index().asfreq('D').fillna(0)
 
-    indexer_product = StringIndexer(inputCol="product_id", outputCol="product_idx")
-    indexer_store = StringIndexer(inputCol="store_id", outputCol="store_idx")
-    encoder_product = OneHotEncoder(inputCol="product_idx", outputCol="product_vec")
-    encoder_store = OneHotEncoder(inputCol="store_idx", outputCol="store_vec")
+if len(ts_data) > 10:
+    train_size = int(len(ts_data) * 0.8)
+    train_series = ts_data["Sales"].iloc[:train_size]
+    test_series = ts_data["Sales"].iloc[train_size:]
 
-    feature_cols = [
-        "day_of_month",
-        "day_of_week",
-        "month",
-        "year",
-        "week_of_year",
-        "lag_1_day_qty",
-        "product_vec",
-        "store_vec",
-    ]
+    model_arima = ARIMA(train_series, order=(5, 1, 0))
+    results_arima = model_arima.fit()
+    joblib.dump(results_arima, f"{MODEL_SAVE_BASE}/arima_model.pkl")
 
-    assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
-    featurizer_pipeline = Pipeline(
-        stages=[
-            indexer_product,
-            indexer_store,
-            encoder_product,
-            encoder_store,
-            assembler,
-        ]
-    )
+    forecast = results_arima.forecast(steps=len(test_series))
+    actual = test_series.to_numpy()
+    predicted = forecast.to_numpy()
+    errors = predicted - actual
+    mse = float(np.mean(errors ** 2))
+    rmse = float(np.sqrt(mse))
+    variance = float(np.sum((actual - np.mean(actual)) ** 2))
+    r2 = 0.0 if variance == 0 else float(1 - (np.sum(errors ** 2) / variance))
 
-    featurizer_model = featurizer_pipeline.fit(daily_agg_df)
-    ml_df = featurizer_model.transform(daily_agg_df)
-    model_data = ml_df.select("features", "daily_quantity")
+    accuracy_metrics.append({"Model": "ARIMA", "RMSE": rmse, "MSE": mse, "R2": r2})
+else:
+    print("[WARN] Insufficient data for ARIMA")
 
-    train_data, test_data = model_data.randomSplit([0.8, 0.2], seed=42)
+# ─── 5. Save Accuracies to CSV ────────────────────────────────────────────────
+accuracy_df = pd.DataFrame(accuracy_metrics)
+accuracy_df.to_csv(f"{LOCAL_ANALYSIS_PATH}/model_accuracies.csv", index=False)
 
-    lr = LinearRegression(
-        featuresCol="features",
-        labelCol="daily_quantity",
-        maxIter=10,
-        regParam=0.3,
-        elasticNetParam=0.8,
-    )
-    lr_model = lr.fit(train_data)
+print("\n=== Model Performance Summary ===")
+print(accuracy_df)
+print(f"\n✅ Accuracies saved to {LOCAL_ANALYSIS_PATH}/model_accuracies.csv")
 
-    predictions = lr_model.transform(test_data)
-    evaluator_rmse = RegressionEvaluator(
-        labelCol="daily_quantity", predictionCol="prediction", metricName="rmse"
-    )
-    evaluator_r2 = RegressionEvaluator(
-        labelCol="daily_quantity", predictionCol="prediction", metricName="r2"
-    )
-
-    rmse = evaluator_rmse.evaluate(predictions)
-    r2 = evaluator_r2.evaluate(predictions)
-
-    featurizer_model.write().overwrite().save(featurizer_path)
-    lr_model.write().overwrite().save(lr_model_path)
-    featurizer_model.write().overwrite().save(local_featurizer_path)
-    lr_model.write().overwrite().save(local_lr_model_path)
-
-    metrics = {
-        "rmse": rmse,
-        "r2": r2,
-        "train_rows": train_data.count(),
-        "test_rows": test_data.count(),
-        "featurizer_path": featurizer_path,
-        "lr_model_path": lr_model_path,
-        "local_featurizer_path": local_featurizer_path,
-        "local_lr_model_path": local_lr_model_path,
-    }
-
-    with open(f"{output_dir}/ml_metrics.json", "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-
-    print("Model training complete")
-    print(json.dumps(metrics, indent=2))
-
-    spark.stop()
-
-
-if __name__ == "__main__":
-    main()
+spark.stop()

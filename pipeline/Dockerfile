@@ -20,6 +20,12 @@ RUN pip install pandas \
     hdfs \
     pyspark==3.5.1
 
+RUN pip install statsmodels joblib
+
+# ENV HADOOP_COMMON_LIB_NATIVE_DIR=/usr/lib/hadoop/lib/native
+# ENV HADOOP_OPTS="$HADOOP_OPTS -Djava.library.path=/usr/lib/hadoop/lib/native"
+# ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/hadoop/lib/native
+
 # Set working directory
 WORKDIR /pipeline
 COPY . /pipeline
