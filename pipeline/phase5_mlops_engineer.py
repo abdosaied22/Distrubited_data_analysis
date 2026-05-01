@@ -14,7 +14,9 @@ spark.sparkContext.setLogLevel("ERROR")
 # Use the LOCAL directory defined in your Phase 3
 LOCAL_MODEL_DIR = "/pipeline/data/models"
 # Use the HDFS path where Big Data Engineer (Phase 4) saved the optimized data
-HDFS_DATA_PATH = "hdfs://namenode:9000/user/data-engineer/demand_forecasting/optimized_data"
+HDFS_DATA_PATH = (
+    "hdfs://namenode:9000/user/data-engineer/demand_forecasting/optimized_data"
+)
 # Path to save the health report
 MANIFEST_OUT = "/pipeline/data/optimized_results/mlops_manifest.json"
 
@@ -108,21 +110,18 @@ r2 = evaluator.evaluate(predictions, {evaluator.metricName: "r2"})
 
 # Threshold logic: Flag if accuracy drops (RMSE increases)
 # (Adjust 1000.0 based on your specific TotalAmount scales)
-is_healthy = rmse < 1000.0 
+is_healthy = rmse < 1000.0
 
 # ─── 5. SAVE MONITORING MANIFEST ───────────────────────────────────────────
 manifest = {
     "pipeline_run": datetime.now().isoformat(),
     "model_type": "Spark_ML_Random_Forest",
     "deployment_source": "Local_Disk_Volume",
-    "metrics": {
-        "rmse": round(rmse, 4),
-        "r2": round(r2, 4)
-    },
+    "metrics": {"rmse": round(rmse, 4), "r2": round(r2, 4)},
     "monitoring": {
         "status": "HEALTHY" if is_healthy else "DEGRADED",
-        "action_required": not is_healthy
-    }
+        "action_required": not is_healthy,
+    },
 }
 
 os.makedirs(os.path.dirname(MANIFEST_OUT), exist_ok=True)

@@ -32,15 +32,23 @@ except Exception as e:
     sys.exit(1)
 
 # Feature Engineering: Adding Month and DayOfWeek
-df_ml = df.withColumn("Month", F.month("OrderDate")) \
-          .withColumn("DayOfWeek", F.dayofweek("OrderDate")) \
-          .fillna(0)
+df_ml = (
+    df.withColumn("Month", F.month("OrderDate"))
+    .withColumn("DayOfWeek", F.dayofweek("OrderDate"))
+    .fillna(0)
+)
 
 # ─── 2. Setup Evaluation ─────────────────────────────────────────────────────
 # We will track RMSE, MSE, and R2
-evaluator_rmse = RegressionEvaluator(labelCol="TotalAmount", predictionCol="prediction", metricName="rmse")
-evaluator_mse = RegressionEvaluator(labelCol="TotalAmount", predictionCol="prediction", metricName="mse")
-evaluator_r2 = RegressionEvaluator(labelCol="TotalAmount", predictionCol="prediction", metricName="r2")
+evaluator_rmse = RegressionEvaluator(
+    labelCol="TotalAmount", predictionCol="prediction", metricName="rmse"
+)
+evaluator_mse = RegressionEvaluator(
+    labelCol="TotalAmount", predictionCol="prediction", metricName="mse"
+)
+evaluator_r2 = RegressionEvaluator(
+    labelCol="TotalAmount", predictionCol="prediction", metricName="r2"
+)
 
 FEATURE_COLS = ["Quantity", "Discount", "Tax", "ShippingCost", "Month", "DayOfWeek"]
 assembler = VectorAssembler(inputCols=FEATURE_COLS, outputCol="features")
@@ -51,39 +59,40 @@ accuracy_metrics = []
 
 # ─── 3. Train & Evaluate Models ──────────────────────────────────────────────
 models = {
-    "Linear_Regression": LinearRegression(featuresCol="scaledFeatures", labelCol="TotalAmount"),
-    "Random_Forest": RandomForestRegressor(featuresCol="scaledFeatures", labelCol="TotalAmount"),
-    "Gradient_Boosting": GBTRegressor(featuresCol="scaledFeatures", labelCol="TotalAmount")
+    "Linear_Regression": LinearRegression(
+        featuresCol="scaledFeatures", labelCol="TotalAmount"
+    ),
+    "Random_Forest": RandomForestRegressor(
+        featuresCol="scaledFeatures", labelCol="TotalAmount"
+    ),
+    "Gradient_Boosting": GBTRegressor(
+        featuresCol="scaledFeatures", labelCol="TotalAmount"
+    ),
 }
 
 for name, model_obj in models.items():
     print(f"[INFO] Training {name}...")
     pipeline = Pipeline(stages=[assembler, scaler, model_obj])
     fit_model = pipeline.fit(train_df)
-    
+
     # Save Model to local disk (which is your mapped volume)
     fit_model.write().overwrite().save(f"{MODEL_SAVE_BASE}/{name}")
-    
+
     # Predictions & Metrics
     preds = fit_model.transform(test_df)
     rmse = evaluator_rmse.evaluate(preds)
     mse = evaluator_mse.evaluate(preds)
     r2 = evaluator_r2.evaluate(preds)
-    
-    accuracy_metrics.append({
-        "Model": name,
-        "RMSE": rmse,
-        "MSE": mse,
-        "R2": r2
-    })
+
+    accuracy_metrics.append({"Model": name, "RMSE": rmse, "MSE": mse, "R2": r2})
 
 # ─── 4. ARIMA (Time Series) ──────────────────────────────────────────────────
 print("[INFO] Processing ARIMA...")
 from statsmodels.tsa.arima.model import ARIMA
 
 ts_data = df_ml.groupBy("OrderDate").agg(F.sum("TotalAmount").alias("Sales")).toPandas()
-ts_data['OrderDate'] = pd.to_datetime(ts_data['OrderDate'])
-ts_data = ts_data.set_index('OrderDate').sort_index().asfreq('D').fillna(0)
+ts_data["OrderDate"] = pd.to_datetime(ts_data["OrderDate"])
+ts_data = ts_data.set_index("OrderDate").sort_index().asfreq("D").fillna(0)
 
 if len(ts_data) > 10:
     train_size = int(len(ts_data) * 0.8)
@@ -98,10 +107,10 @@ if len(ts_data) > 10:
     actual = test_series.to_numpy()
     predicted = forecast.to_numpy()
     errors = predicted - actual
-    mse = float(np.mean(errors ** 2))
+    mse = float(np.mean(errors**2))
     rmse = float(np.sqrt(mse))
     variance = float(np.sum((actual - np.mean(actual)) ** 2))
-    r2 = 0.0 if variance == 0 else float(1 - (np.sum(errors ** 2) / variance))
+    r2 = 0.0 if variance == 0 else float(1 - (np.sum(errors**2) / variance))
 
     accuracy_metrics.append({"Model": "ARIMA", "RMSE": rmse, "MSE": mse, "R2": r2})
 else:
