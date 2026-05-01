@@ -4,6 +4,9 @@ import os
 import sys
 from datetime import datetime
 
+from pathlib import Path
+
+from helper import get_spark
 from pyspark.ml import PipelineModel
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.sql import SparkSession
@@ -11,12 +14,14 @@ from pyspark.sql import functions as F
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 LOCAL_MODEL_DIR = "/pipeline/data/models"
+MODEL_PATH = f"file://{LOCAL_MODEL_DIR}/Gradient_Boosting"
 HDFS_DATA_PATH = (
-    "hdfs://namenode:9000/user/data-engineer/demand_forecasting/optimized_data"
+    "hdfs://namenode:9000/user/data-engineer/demand_forecasting/cleaned_data"
 )
 MANIFEST_OUT = "/pipeline/data/optimized_results/mlops_manifest.json"
-MODEL_NAME = "Random_Forest"
-MODEL_VERSION = "v1"  # Placeholder for registry-based versioning.
+MODEL_NAME = "Gradient_Boosting"
+SAMPLE_ROWS = 100
+FEATURE_COLS = ["Quantity", "Discount", "Tax", "ShippingCost", "Month", "DayOfWeek"]
 
 
 def setup_logging() -> logging.Logger:
@@ -29,90 +34,48 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
-def get_spark(app_name: str) -> SparkSession:
-    spark = SparkSession.builder.appName(app_name).getOrCreate()
-    spark.sparkContext.setLogLevel("ERROR")
-    return spark
-
-
 def load_model(
     local_model_dir: str, model_name: str, logger: logging.Logger
 ) -> PipelineModel:
-    model_path = os.path.join(local_model_dir, model_name)
-    logger.info("[DEPLOY] Loading model from: %s", model_path)
+    model_path = Path(local_model_dir) / model_name
+    logger.info("[DEPLOY] Loading model from: %s", MODEL_PATH)
+    if not model_path.exists():
+        logger.error("Model path does not exist: %s", model_path)
+        try:
+            logger.error(
+                "Available models in %s: %s",
+                local_model_dir,
+                sorted(os.listdir(local_model_dir)),
+            )
+        except OSError as exc:
+            logger.error("Could not list model directory: %s", exc)
+        raise RuntimeError("Model path missing")
     try:
-        return PipelineModel.load(model_path)
+        return PipelineModel.load(MODEL_PATH)
     except Exception as exc:
-        logger.error("Could not load Spark model from %s", model_path)
-        logger.error(
-            "Ensure Phase 3 completed and the folder exists on your local device."
-        )
+        logger.exception("Could not load Spark model from %s", MODEL_PATH)
         raise RuntimeError("Model load failed") from exc
 
 
-def read_optimized_data(spark: SparkSession, hdfs_path: str, logger: logging.Logger):
-    logger.info("[AUTO] Reading optimized data for inference...")
+def read_cleaned_data(spark: SparkSession, hdfs_path: str, logger: logging.Logger):
+    logger.info("[AUTO] Reading cleaned data for inference...")
     return spark.read.parquet(hdfs_path)
 
 
-def prepare_features(df_optimized, logger: logging.Logger):
-    df_lower = df_optimized.toDF(*[c.lower() for c in df_optimized.columns])
-    lower_cols = set(df_lower.columns)
-    logger.info("[AUTO] Input columns: %s", sorted(lower_cols))
-
-    order_date_col = "order_date" if "order_date" in lower_cols else "orderdate"
-    if order_date_col not in lower_cols:
-        raise ValueError("Missing required column: order_date/orderdate")
-    if "quantity" not in lower_cols:
-        raise ValueError("Missing required column: quantity")
-
-    base_cols = {
-        "OrderDate": F.to_date(F.col(order_date_col)),
-        "Quantity": F.col("quantity").cast("double"),
-        "Discount": (
-            F.col("discount").cast("double") if "discount" in lower_cols else F.lit(0.0)
-        ),
-        "Tax": F.col("tax").cast("double") if "tax" in lower_cols else F.lit(0.0),
-        "ShippingCost": (
-            F.col("shippingcost").cast("double")
-            if "shippingcost" in lower_cols
-            else F.lit(0.0)
-        ),
-    }
-
-    if "total_sales" in lower_cols:
-        total_amount = F.col("total_sales").cast("double")
-    elif "totalamount" in lower_cols:
-        total_amount = F.col("totalamount").cast("double")
-    elif "price" in lower_cols and "quantity" in lower_cols:
-        total_amount = (F.col("price") * F.col("quantity")).cast("double")
-    else:
-        raise ValueError(
-            "Missing TotalAmount; expected total_sales, totalamount, or price+quantity"
-        )
-
+def select_model_columns(df, logger: logging.Logger):
     df_features = (
-        df_lower.withColumn("OrderDate", base_cols["OrderDate"])
-        .withColumn("Quantity", base_cols["Quantity"])
-        .withColumn("Discount", base_cols["Discount"])
-        .withColumn("Tax", base_cols["Tax"])
-        .withColumn("ShippingCost", base_cols["ShippingCost"])
-        .withColumn("TotalAmount", total_amount)
+        df.withColumn("OrderDate", F.to_date(F.col("OrderDate")))
+        .withColumn("Quantity", F.col("Quantity").cast("double"))
+        .withColumn("Discount", F.col("Discount").cast("double"))
+        .withColumn("Tax", F.col("Tax").cast("double"))
+        .withColumn("ShippingCost", F.col("ShippingCost").cast("double"))
+        .withColumn("TotalAmount", F.col("TotalAmount").cast("double"))
         .withColumn("Month", F.month("OrderDate"))
         .withColumn("DayOfWeek", F.dayofweek("OrderDate"))
-        .select(
-            "OrderDate",
-            "Quantity",
-            "Discount",
-            "Tax",
-            "ShippingCost",
-            "TotalAmount",
-            "Month",
-            "DayOfWeek",
-        )
+        .select("TotalAmount", *FEATURE_COLS)
     )
 
-    logger.info("[AUTO] Feature columns prepared")
+    logger.info("[AUTO] Feature columns prepared: %s", FEATURE_COLS)
     return df_features
 
 
@@ -129,7 +92,7 @@ def write_manifest(
 ) -> None:
     manifest = {
         "pipeline_run": datetime.now().isoformat(),
-        "model_type": "Spark_ML_Random_Forest",
+        "model_type": f"Spark_ML_{MODEL_NAME}",
         "deployment_source": "Local_Disk_Volume",
         "metrics": {"rmse": round(rmse, 4), "r2": round(r2, 4)},
         "monitoring": {
@@ -150,8 +113,9 @@ def main() -> int:
 
     try:
         model = load_model(LOCAL_MODEL_DIR, MODEL_NAME, logger)
-        df_optimized = read_optimized_data(spark, HDFS_DATA_PATH, logger)
-        df_features = prepare_features(df_optimized, logger)
+        df_cleaned = read_cleaned_data(spark, HDFS_DATA_PATH, logger)
+        df_features = select_model_columns(df_cleaned, logger).limit(SAMPLE_ROWS)
+        logger.info("[AUTO] Using sample size: %s", SAMPLE_ROWS)
 
         predictions = model.transform(df_features).cache()
         rmse, r2 = evaluate_predictions(predictions, logger)
