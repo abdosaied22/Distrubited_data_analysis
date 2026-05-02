@@ -69,6 +69,19 @@ def main() -> None:
 
     print("\n✅ E2E Pipeline completed successfully.")
 
+    streamlit_port = os.getenv("STREAMLIT_PORT", "8501")
+    print(f"[INFO] Starting Streamlit on port {streamlit_port}...")
+    subprocess.run(
+        [
+            "streamlit",
+            "run",
+            "streamlit_app.py",
+            "--server.address=0.0.0.0",
+            f"--server.port={streamlit_port}",
+        ],
+        check=True,
+    )
+
 
 if __name__ == "__main__":
     main()
